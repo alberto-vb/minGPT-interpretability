@@ -112,7 +112,7 @@ class GPT(nn.Module):
         C.attn_pdrop = 0.1
         return C
 
-    def __init__(self, config):
+    def __init__(self, config, save_activations_enabled=False, patch_embeddings_enabled=False):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
@@ -159,6 +159,10 @@ class GPT(nn.Module):
         # report number of parameters (note we don't count the decoder parameters in lm_head)
         n_params = sum(p.numel() for p in self.transformer.parameters())
         print("number of parameters: %.2fM" % (n_params/1e6,))
+        self.save_activations_enabled: bool = save_activations_enabled
+        self.patch_embeddings_enabled: bool = patch_embeddings_enabled
+        self.saved_activations: list | None = None
+        self.last_token_logits = None
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -172,7 +176,7 @@ class GPT(nn.Module):
             torch.nn.init.ones_(module.weight)
 
     @classmethod
-    def from_pretrained(cls, model_type):
+    def from_pretrained(cls, model_type, save_activations_enabled=False, patch_embeddings_enabled=False):
         """
         Initialize a pretrained GPT model by copying over the weights
         from a huggingface/transformers checkpoint.
@@ -185,7 +189,7 @@ class GPT(nn.Module):
         config.model_type = model_type
         config.vocab_size = 50257 # openai's model vocabulary
         config.block_size = 1024  # openai's model block_size
-        model = GPT(config)
+        model = GPT(config, save_activations_enabled, patch_embeddings_enabled)
         sd = model.state_dict()
 
         # init a huggingface/transformers model
@@ -257,7 +261,7 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
         return optimizer
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, layer_to_patch: int | None = None, embedding_to_patch: int | None = None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.block_size, f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
@@ -267,10 +271,33 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
+
+        # Save the input embedding activations if required
+        if self.save_activations_enabled:
+            self.saved_activations = []
+
+        for layer_idx, block in enumerate(self.transformer.h):
+            # Save the activations for the current layer
+            if self.save_activations_enabled:
+                self.saved_activations.append(x.detach().clone())
+
+            # Patch the activations for the specified layer and position
+            if (
+                    self.patch_embeddings_enabled
+                    and layer_idx == layer_to_patch
+                    and layer_to_patch is not None
+                    and embedding_to_patch is not None
+            ):
+                x[0][embedding_to_patch] = self.saved_activations[layer_to_patch][0][embedding_to_patch]
+
+            # Forward the block
             x = block(x)
+
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
+
+        # Save the logits of the last token
+        self.last_token_logits = logits[:, -1, :]  # (b, vocab_size)
 
         # if we are given some desired targets also calculate the loss
         loss = None
@@ -280,7 +307,7 @@ class GPT(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, do_sample=False, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, do_sample=False, top_k=None, layer_to_patch: int | None = None, embedding_to_patch: int | None =None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -290,7 +317,7 @@ class GPT(nn.Module):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            logits, _ = self(idx_cond, layer_to_patch=layer_to_patch, embedding_to_patch=embedding_to_patch)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
