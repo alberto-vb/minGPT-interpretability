@@ -21,6 +21,15 @@ This project extends Karpathy's minGPT to explore mechanistic interpretability i
    git clone https://github.com/your-username/minGPT-Insights.git
    cd minGPT-Insights
    ```
+2. **Install dependencies**
+   ```bash
+   uv venv
+   uv pip install -r requirements.txt
+   ```
+4. **Run interpretability.py**
+   ```bash
+   python interpretability.py
+   ```
 
 ## Experiment Details
 The interpretability.py script compares pairs of texts differing by a single token and analyzes how embedding patches affect GPT-2's predictions.
